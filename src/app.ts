@@ -1,6 +1,7 @@
 import express, { Request, Response } from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
+import path from 'path';
 import { sql, initializeNeonDatabase, authenticateUser, ADMIN_EMAIL } from './config/neon';
 import posPaymentRoutes from './routes/posPaymentRoutes';
 
@@ -10,6 +11,30 @@ export const app = express();
 
 app.use(cors());
 app.use(express.json());
+
+// Serve static files from public directory
+app.use(express.static(path.join(process.cwd(), 'public')));
+
+// Root Landing Page Endpoint
+app.get('/', (req: Request, res: Response) => {
+  const htmlPath = path.join(process.cwd(), 'public', 'index.html');
+  res.sendFile(htmlPath, (err) => {
+    if (err) {
+      res.json({
+        status: 'ONLINE',
+        service: 'Menuvora AI Node.js Express Backend',
+        message: 'Welcome to Menuvora AI Backend API',
+        endpoints: {
+          health: '/api/health',
+          users: '/api/users',
+          orders: '/api/orders',
+          checkout: 'POST /api/checkout',
+          login: 'POST /api/auth/login'
+        }
+      });
+    }
+  });
+});
 
 // Initialize Neon PostgreSQL Database schema on startup
 initializeNeonDatabase();
