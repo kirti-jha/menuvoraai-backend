@@ -440,52 +440,56 @@ export class PosPaymentController {
   }
 
   /**
-   * 6. List All Live POS Transactions
+   * Fetch All POS Transactions (For Merchant Dashboard & History)
    * Endpoint: GET /api/payments/pos/transactions
    */
-  static async getAllTransactions(req: Request, res: Response) {
+  static async listTransactions(req: Request, res: Response) {
     try {
+      let transactions: any[] = [];
+      // Query Neon PostgreSQL DB
       if (sql) {
         try {
           await initializeNeonDatabase();
           const rows = await sql`
-            SELECT transaction_id, order_id, external_ref_number, p2p_request_id, amount, payment_mode, device_id, status, created_at, updated_at
+            SELECT 
+              transaction_id AS "transactionId",
+              external_ref_number AS "externalRefNumber",
+              customer_email AS "customerEmail",
+              customer_mobile AS "customerMobileNumber",
+              amount,
+              payment_mode AS "paymentMode",
+              device_id AS "deviceId",
+              status,
+              created_at AS "timestamp"
             FROM pos_transactions
             ORDER BY id DESC;
           `;
-          return res.json({
-            success: true,
-            count: rows.length,
-            data: rows.map((r: any) => ({
-              transactionId: r.transaction_id,
-              orderId: r.order_id,
-              externalRefNumber: r.external_ref_number,
-              p2pRequestId: r.p2p_request_id,
-              amount: parseFloat(r.amount),
-              paymentMode: r.payment_mode,
-              deviceId: r.device_id,
-              status: r.status,
-              createdAt: r.created_at,
-              updatedAt: r.updated_at
-            }))
-          });
+          transactions = rows;
         } catch (dbErr) {
-          console.error('Neon DB fetch all transactions error:', dbErr);
+          console.error('Neon DB fetch pos_transactions error:', dbErr);
         }
       }
-
-      const list = Array.from(memoryPosTransactions.values());
+      // Fallback to in-memory transactions if DB query returns empty
+      if (transactions.length === 0) {
+        transactions = Array.from(memoryPosTransactions.values());
+      }
       return res.json({
         success: true,
-        count: list.length,
-        data: list
+        count: transactions.length,
+        data: transactions
       });
     } catch (err: any) {
+      console.error('Fetch POS Transactions Error:', err);
       return res.status(500).json({
         success: false,
-        message: 'Error fetching transactions list.',
-        code: 'POS_LIST_FAILED'
+        message: 'Failed to fetch POS transactions history.',
+        code: 'POS_FETCH_ALL_FAILED'
       });
     }
+  }
+
+  // Alias for backward compatibility
+  static async getAllTransactions(req: Request, res: Response) {
+    return PosPaymentController.listTransactions(req, res);
   }
 }
