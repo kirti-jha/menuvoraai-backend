@@ -69,8 +69,10 @@ export class EzetapService {
       ...(params.additionalData ? { additionalData: params.additionalData } : {}),
     };
 
+    let lastErrorMsg = 'Failed to connect to Ezetap / Razorpay POS API.';
+
     for (const url of endpoints) {
-      console.log(`📡 [Ezetap Service] Requesting POS Pay API at ${url} for Ref: ${params.externalRefNumber}`);
+      console.log(`📡 [Ezetap Service] Requesting Live POS Pay API at ${url} for Ref: ${params.externalRefNumber}`);
 
       try {
         const res = await fetch(url, {
@@ -79,24 +81,25 @@ export class EzetapService {
           body: JSON.stringify(payload),
         });
 
-        if (res.ok) {
-          const data = (await res.json()) as EzetapInitiateResponse;
+        const data = (await res.json()) as EzetapInitiateResponse;
+        if (res.ok && data.success !== false) {
           return data;
         }
-      } catch (err) {
-        console.warn(`⚠️ [Ezetap Service] HTTPS call to ${url} failed. Trying next endpoint...`);
+
+        if (data.errorMessage) {
+          lastErrorMsg = data.errorMessage;
+        }
+      } catch (err: any) {
+        console.warn(`⚠️ [Ezetap Service] HTTPS call to ${url} failed:`, err?.message || err);
       }
     }
 
-    // Fallback Ezetap Bridge Simulator Response for DEMO environment testing when external API is unreachable
-    const simulatedP2pRequestId = `P2P_REQ_${Math.floor(10000000 + Math.random() * 90000000)}`;
     return {
-      success: true,
-      messageCode: 'P2P_INITIATED',
-      message: 'Payment request dispatched to POS device',
-      errorCode: null,
-      errorMessage: null,
-      p2pRequestId: simulatedP2pRequestId,
+      success: false,
+      messageCode: 'POS_LIVE_API_ERROR',
+      message: lastErrorMsg,
+      errorCode: 'EZETAP_COMMUNICATION_FAILED',
+      errorMessage: lastErrorMsg,
     };
   }
 
@@ -114,28 +117,29 @@ export class EzetapService {
     };
 
     try {
+      console.log(`📡 [Ezetap Service] Querying Live Status at ${url} for P2P Req: ${origP2pRequestId}`);
       const res = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       });
 
+      const data = (await res.json()) as EzetapStatusResponse;
       if (res.ok) {
-        const data = (await res.json()) as EzetapStatusResponse;
         return data;
       }
-    } catch (err) {
-      console.warn(`⚠️ [Ezetap Service] Status check call failed for ${origP2pRequestId}`);
+      return data;
+    } catch (err: any) {
+      console.warn(`⚠️ [Ezetap Service] Live status query error:`, err?.message || err);
+      return {
+        success: false,
+        status: 'PENDING',
+        messageCode: 'STATUS_QUERY_FAILED',
+        message: 'Unable to query live status from POS server',
+        errorCode: 'STATUS_FETCH_ERROR',
+        errorMessage: err?.message || 'Connection error',
+      };
     }
-
-    return {
-      success: true,
-      status: 'AUTHORIZED',
-      messageCode: 'P2P_DEVICE_TXN_DONE',
-      message: 'Transaction completed on POS device',
-      errorCode: null,
-      errorMessage: null,
-    };
   }
 
   /**
@@ -159,28 +163,29 @@ export class EzetapService {
 
     for (const url of endpoints) {
       try {
+        console.log(`📡 [Ezetap Service] Sending Live Cancel Request to ${url}`);
         const res = await fetch(url, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload),
         });
 
+        const data = (await res.json()) as EzetapStatusResponse;
         if (res.ok) {
-          const data = (await res.json()) as EzetapStatusResponse;
           return data;
         }
-      } catch (err) {
-        console.warn(`⚠️ [Ezetap Service] Cancel API call failed for ${url}`);
+      } catch (err: any) {
+        console.warn(`⚠️ [Ezetap Service] Cancel API call failed for ${url}:`, err?.message || err);
       }
     }
 
     return {
-      success: true,
-      status: 'CANCELLED',
-      messageCode: 'P2P_DEVICE_CANCELED',
-      message: 'Transaction cancelled successfully on POS device',
-      errorCode: null,
-      errorMessage: null,
+      success: false,
+      status: 'FAILED',
+      messageCode: 'CANCEL_FAILED',
+      message: 'Failed to send cancellation request to POS device',
+      errorCode: 'CANCEL_API_FAILED',
+      errorMessage: 'Cancellation failed',
     };
   }
 }
