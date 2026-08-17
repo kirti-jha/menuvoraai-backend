@@ -438,4 +438,54 @@ export class PosPaymentController {
       });
     }
   }
+
+  /**
+   * 6. List All Live POS Transactions
+   * Endpoint: GET /api/payments/pos/transactions
+   */
+  static async getAllTransactions(req: Request, res: Response) {
+    try {
+      if (sql) {
+        try {
+          await initializeNeonDatabase();
+          const rows = await sql`
+            SELECT transaction_id, order_id, external_ref_number, p2p_request_id, amount, payment_mode, device_id, status, created_at, updated_at
+            FROM pos_transactions
+            ORDER BY id DESC;
+          `;
+          return res.json({
+            success: true,
+            count: rows.length,
+            data: rows.map((r: any) => ({
+              transactionId: r.transaction_id,
+              orderId: r.order_id,
+              externalRefNumber: r.external_ref_number,
+              p2pRequestId: r.p2p_request_id,
+              amount: parseFloat(r.amount),
+              paymentMode: r.payment_mode,
+              deviceId: r.device_id,
+              status: r.status,
+              createdAt: r.created_at,
+              updatedAt: r.updated_at
+            }))
+          });
+        } catch (dbErr) {
+          console.error('Neon DB fetch all transactions error:', dbErr);
+        }
+      }
+
+      const list = Array.from(memoryPosTransactions.values());
+      return res.json({
+        success: true,
+        count: list.length,
+        data: list
+      });
+    } catch (err: any) {
+      return res.status(500).json({
+        success: false,
+        message: 'Error fetching transactions list.',
+        code: 'POS_LIST_FAILED'
+      });
+    }
+  }
 }
