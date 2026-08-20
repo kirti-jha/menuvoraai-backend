@@ -1,6 +1,37 @@
 import { Request, Response } from 'express';
+import fs from 'fs';
+import path from 'path';
 import { EzetapService } from '../services/ezetapService';
 import { sql, initializeNeonDatabase } from '../config/neon';
+
+// Helper function to log EVERY incoming callback request to disk file: logs/pos_callbacks.log
+function writeCallbackLog(req: Request) {
+  try {
+    const logDir = path.join(process.cwd(), 'logs');
+    if (!fs.existsSync(logDir)) {
+      fs.mkdirSync(logDir, { recursive: true });
+    }
+    const logFilePath = path.join(logDir, 'pos_callbacks.log');
+    const timestamp = new Date().toISOString();
+    const clientIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'UNKNOWN';
+
+    const logEntry = `--------------------------------------------------------------------------------
+[CALLBACK RECEIVED] ${timestamp}
+Method: ${req.method}
+URL: ${req.originalUrl || req.url}
+Client IP: ${clientIp}
+Content-Type: ${req.headers['content-type'] || 'N/A'}
+Headers: ${JSON.stringify(req.headers, null, 2)}
+Query Params: ${JSON.stringify(req.query, null, 2)}
+Body: ${JSON.stringify(req.body, null, 2)}
+--------------------------------------------------------------------------------\n\n`;
+
+    fs.appendFileSync(logFilePath, logEntry, 'utf-8');
+    console.log(`📝 [Callback File Logger] Appended incoming callback to ${logFilePath}`);
+  } catch (err) {
+    console.error('❌ [Callback File Logger Error]:', err);
+  }
+}
 
 // In-Memory Transaction Fallback Store (when DB connection string isn't provided)
 const memoryPosTransactions = new Map<string, any>();
@@ -345,18 +376,42 @@ export class PosPaymentController {
   }
 
   /**
-   * 5. Server-to-Server Callback Webhook Handler (IDEMPOTENT)
-   * Endpoint: POST /api/payments/pos/callback
+   * 5. Server-to-Server Callback Webhook Handler (IDEMPOTENT & UPSERT READY)
+   * Endpoint: POST / GET /api/payments/pos/callback
    */
   static async handleCallback(req: Request, res: Response) {
+    // 0. Log EVERY incoming request immediately to file (logs/pos_callbacks.log)
+    writeCallbackLog(req);
+
     try {
-      const callbackPayload = req.body;
-      const { p2pRequestId, origP2pRequestId, externalRefNumber, status, messageCode } = callbackPayload;
+      // Merge body & query parameters to support GET and POST (JSON, urlencoded, query string)
+      const rawPayload = { ...req.query, ...req.body };
+      const nestedData = rawPayload.data || rawPayload.response || rawPayload.payload || rawPayload.txnReport || {};
+      const callbackPayload = { ...rawPayload, ...nestedData };
 
-      const targetP2pReqId = p2pRequestId || origP2pRequestId || callbackPayload.data?.p2pRequestId;
-      const refNumber = externalRefNumber || callbackPayload.data?.externalRefNumber;
+      // Flexible extraction of IDs and Fields from Ezetap / Razorpay POS callback payloads
+      const targetP2pReqId = callbackPayload.p2pRequestId || 
+                             callbackPayload.origP2pRequestId || 
+                             callbackPayload.p2p_request_id || 
+                             callbackPayload.requestId || 
+                             callbackPayload.txnId || 
+                             '';
 
-      const key = `${targetP2pReqId}_${refNumber}_${status}`;
+      const refNumber = callbackPayload.externalRefNumber || 
+                        callbackPayload.external_ref_number || 
+                        callbackPayload.orderId || 
+                        callbackPayload.order_id || 
+                        callbackPayload.refNumber || 
+                        `ORD_POS_${Date.now()}`;
+
+      const rawStatus = (callbackPayload.status || callbackPayload.txnStatus || callbackPayload.messageCode || callbackPayload.responseCode || '').toString().toUpperCase();
+      const amountVal = callbackPayload.amount || callbackPayload.txnAmount || callbackPayload.totalAmount || 0;
+      const paymentModeVal = (callbackPayload.paymentMode || callbackPayload.payment_mode || callbackPayload.mode || 'CARD').toString().toUpperCase();
+      const deviceIdVal = callbackPayload.deviceId || callbackPayload.device_id || callbackPayload.pushTo?.deviceId || 'POS_DEVICE';
+      const customerMobileVal = callbackPayload.customerMobileNumber || callbackPayload.customer_mobile || callbackPayload.customerMobile || '';
+      const customerEmailVal = callbackPayload.customerEmail || callbackPayload.customer_email || callbackPayload.email || '';
+
+      const key = `${targetP2pReqId}_${refNumber}_${rawStatus}`;
 
       // Idempotency Check: Don't re-process exact duplicate callback
       if (memoryPosCallbacks.has(key)) {
@@ -373,20 +428,10 @@ export class PosPaymentController {
       if (sql) {
         try {
           await initializeNeonDatabase();
-          
-          // Check if already in DB
-          const existing = await sql`
-            SELECT id FROM pos_callbacks 
-            WHERE p2p_request_id = ${targetP2pReqId || ''} AND external_ref_number = ${refNumber || ''} 
-            LIMIT 1;
+          await sql`
+            INSERT INTO pos_callbacks (p2p_request_id, external_ref_number, status, payload)
+            VALUES (${targetP2pReqId}, ${refNumber}, ${rawStatus || 'COMPLETED'}, ${JSON.stringify(callbackPayload)});
           `;
-
-          if (existing.length === 0) {
-            await sql`
-              INSERT INTO pos_callbacks (p2p_request_id, external_ref_number, status, payload)
-              VALUES (${targetP2pReqId || ''}, ${refNumber || ''}, ${status || 'COMPLETED'}, ${JSON.stringify(callbackPayload)});
-            `;
-          }
         } catch (dbErr) {
           console.error('Neon DB callback audit error:', dbErr);
         }
@@ -394,44 +439,108 @@ export class PosPaymentController {
 
       // Determine mapped status
       let finalStatus = 'SUCCESS';
-      if (status === 'AUTHORIZED' || messageCode === 'P2P_DEVICE_TXN_DONE') {
+      if (
+        rawStatus.includes('AUTHORIZED') || 
+        rawStatus.includes('SUCCESS') || 
+        rawStatus.includes('COMPLETED') || 
+        rawStatus.includes('DONE') || 
+        rawStatus.includes('0000') || 
+        rawStatus.includes('PAID') || 
+        rawStatus.includes('CAPTURED')
+      ) {
         finalStatus = 'SUCCESS';
-      } else if (status === 'FAILED') {
+      } else if (
+        rawStatus.includes('FAIL') || 
+        rawStatus.includes('DECLINED') || 
+        rawStatus.includes('ERROR') || 
+        rawStatus.includes('REJECTED')
+      ) {
         finalStatus = 'FAILED';
-      } else if (status === 'CANCELLED' || messageCode === 'P2P_DEVICE_CANCELED') {
+      } else if (
+        rawStatus.includes('CANCEL')
+      ) {
         finalStatus = 'CANCELLED';
       }
 
-      // Update Transaction Record in DB
-      if (sql && (targetP2pReqId || refNumber)) {
+      // UPSERT Transaction in DB
+      let transactionId = `TXN_${Date.now()}_${Math.floor(100 + Math.random() * 900)}`;
+
+      if (sql) {
         try {
-          await sql`
+          await initializeNeonDatabase();
+          // First attempt UPDATE
+          const updateRes = await sql`
             UPDATE pos_transactions
-            SET status = ${finalStatus}, final_status_response = ${JSON.stringify(callbackPayload)}, updated_at = NOW()
-            WHERE p2p_request_id = ${targetP2pReqId || ''} OR external_ref_number = ${refNumber || ''};
+            SET 
+              status = ${finalStatus}, 
+              p2p_request_id = CASE WHEN ${targetP2pReqId} != '' THEN ${targetP2pReqId} ELSE p2p_request_id END,
+              final_status_response = ${JSON.stringify(callbackPayload)}, 
+              updated_at = NOW()
+            WHERE (p2p_request_id IS NOT NULL AND p2p_request_id != '' AND p2p_request_id = ${targetP2pReqId}) 
+               OR external_ref_number = ${refNumber}
+            RETURNING transaction_id;
           `;
+
+          if (updateRes.length > 0) {
+            transactionId = updateRes[0].transaction_id;
+          } else {
+            // Transaction was NOT found in DB, perform INSERT (UPSERT)
+            await sql`
+              INSERT INTO pos_transactions (
+                transaction_id, order_id, external_ref_number, p2p_request_id, amount, payment_mode, device_id, status, customer_mobile, customer_email, final_status_response
+              ) VALUES (
+                ${transactionId}, ${refNumber}, ${refNumber}, ${targetP2pReqId}, ${parseFloat(amountVal) || 0}, ${paymentModeVal}, ${deviceIdVal}, ${finalStatus}, ${customerMobileVal}, ${customerEmailVal}, ${JSON.stringify(callbackPayload)}
+              );
+            `;
+            console.log(`✨ [POS Callback] New transaction record created from callback: ${refNumber} (Status: ${finalStatus})`);
+          }
         } catch (dbErr) {
-          console.error('Neon DB callback transaction update error:', dbErr);
+          console.error('Neon DB callback transaction upsert error:', dbErr);
         }
       }
 
-      const record = memoryPosTransactions.get(targetP2pReqId) || memoryPosTransactions.get(refNumber);
-      if (record) {
-        record.status = finalStatus;
-        record.updatedAt = new Date().toISOString();
+      // Update / Insert into Memory Fallback Store
+      const existingMemRecord = memoryPosTransactions.get(targetP2pReqId) || memoryPosTransactions.get(refNumber);
+      if (existingMemRecord) {
+        existingMemRecord.status = finalStatus;
+        if (targetP2pReqId) existingMemRecord.p2pRequestId = targetP2pReqId;
+        existingMemRecord.finalStatusResponse = callbackPayload;
+        existingMemRecord.updatedAt = new Date().toISOString();
+        memoryPosTransactions.set(existingMemRecord.transactionId, existingMemRecord);
+        memoryPosTransactions.set(refNumber, existingMemRecord);
+      } else {
+        const newMemRecord = {
+          transactionId,
+          orderId: refNumber,
+          externalRefNumber: refNumber,
+          p2pRequestId: targetP2pReqId,
+          amount: parseFloat(amountVal) || 0,
+          paymentMode: paymentModeVal,
+          deviceId: deviceIdVal,
+          status: finalStatus,
+          customerMobileNumber: customerMobileVal,
+          customerEmail: customerEmailVal,
+          finalStatusResponse: callbackPayload,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString()
+        };
+        memoryPosTransactions.set(transactionId, newMemRecord);
+        memoryPosTransactions.set(refNumber, newMemRecord);
+        if (targetP2pReqId) memoryPosTransactions.set(targetP2pReqId, newMemRecord);
       }
 
-      console.log(`✅ [POS Callback] Processed callback for ${refNumber} -> Status: ${finalStatus}`);
+      console.log(`✅ [POS Callback] Processed callback for ${refNumber} -> Final Status: ${finalStatus}`);
 
       // Always return HTTP 200 to acknowledge Ezetap server-to-server webhook
       return res.status(200).json({
         success: true,
-        message: 'POS callback received and acknowledged successfully.'
+        message: 'POS callback received and acknowledged successfully.',
+        externalRefNumber: refNumber,
+        status: finalStatus
       });
 
     } catch (err: any) {
       console.error('POS Callback Handler Error:', err);
-      // Return HTTP 500 so third-party system can retry up to 3 times as specified in documentation
       return res.status(500).json({
         success: false,
         message: 'Internal error processing callback.'
@@ -471,7 +580,13 @@ export class PosPaymentController {
       }
       // Fallback to in-memory transactions if DB query returns empty
       if (transactions.length === 0) {
-        transactions = Array.from(memoryPosTransactions.values());
+        const uniqueMemTxns = new Map<string, any>();
+        for (const item of memoryPosTransactions.values()) {
+          if (item && item.transactionId) {
+            uniqueMemTxns.set(item.transactionId, item);
+          }
+        }
+        transactions = Array.from(uniqueMemTxns.values());
       }
       return res.json({
         success: true,
@@ -491,5 +606,29 @@ export class PosPaymentController {
   // Alias for backward compatibility
   static async getAllTransactions(req: Request, res: Response) {
     return PosPaymentController.listTransactions(req, res);
+  }
+
+  /**
+   * View Callback Raw Logs Endpoint
+   * Endpoint: GET /api/payments/pos/callback-logs
+   */
+  static async getCallbackLogs(req: Request, res: Response) {
+    try {
+      const logFilePath = path.join(process.cwd(), 'logs', 'pos_callbacks.log');
+      if (!fs.existsSync(logFilePath)) {
+        return res.json({
+          success: true,
+          message: 'No callback logs recorded yet.',
+          logs: ''
+        });
+      }
+      const logs = fs.readFileSync(logFilePath, 'utf-8');
+      return res.type('text/plain').send(logs);
+    } catch (err: any) {
+      return res.status(500).json({
+        success: false,
+        message: 'Failed to read callback log file.'
+      });
+    }
   }
 }
