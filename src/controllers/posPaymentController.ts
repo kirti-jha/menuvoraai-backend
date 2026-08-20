@@ -394,7 +394,7 @@ export class PosPaymentController {
   }
 
   /**
-   * 5. Server-to-Server Callback Webhook Handler (IDEMPOTENT & UPSERT READY)
+   * 5. Server-to-Server Callback Webhook Handler (IDEMPOTENT & SINGLE-ROW DEDUPLICATED)
    * Endpoint: POST / GET /api/payments/pos/callback
    */
   static async handleCallback(req: Request, res: Response) {
@@ -406,15 +406,20 @@ export class PosPaymentController {
       const rawPayload = { ...req.query, ...req.body };
       const nestedData = rawPayload.data || rawPayload.response || rawPayload.payload || rawPayload.txnReport || {};
       const callbackPayload = { ...rawPayload, ...nestedData };
-      const rzpPayment = rawPayload.payload?.payment?.entity || callbackPayload.payload?.payment?.entity || callbackPayload.payment?.entity;
 
-      // Flexible extraction of IDs and Fields from Ezetap / Razorpay POS callback webhooks
+      // Extract Razorpay nested payment entity if present
+      const rzpPayment = rawPayload.payload?.payment?.entity || callbackPayload.payload?.payment?.entity || callbackPayload.payment?.entity;
+      const eventType = (callbackPayload.event || '').toString().toLowerCase();
+
+      // Extraction of unique IDs
+      const rzpPaymentId = rzpPayment?.id || '';
+      const bankRrn = rzpPayment?.acquirer_data?.rrn || callbackPayload.rrn || '';
       const targetP2pReqId = callbackPayload.p2pRequestId || 
                              callbackPayload.origP2pRequestId || 
                              callbackPayload.p2p_request_id || 
                              callbackPayload.requestId || 
                              callbackPayload.txnId || 
-                             rzpPayment?.id ||
+                             rzpPaymentId ||
                              '';
 
       const refNumber = callbackPayload.externalRefNumber || 
@@ -423,14 +428,13 @@ export class PosPaymentController {
                         callbackPayload.order_id || 
                         callbackPayload.refNumber || 
                         rzpPayment?.order_id ||
-                        `ORD_POS_${Date.now()}`;
+                        (rzpPaymentId ? `ORD_${rzpPaymentId}` : `ORD_POS_${Date.now()}`);
 
-      const eventType = (callbackPayload.event || '').toString().toUpperCase();
       const rawStatus = (callbackPayload.status || callbackPayload.txnStatus || callbackPayload.messageCode || callbackPayload.responseCode || rzpPayment?.status || eventType || '').toString().toUpperCase();
 
+      // Amount extraction (Razorpay sends amount in paise e.g. 10000 paise = 100.00 INR)
       let parsedAmount = 0;
       if (rzpPayment && rzpPayment.amount !== undefined && rzpPayment.amount !== null) {
-        // Razorpay webhooks pass amount in paise (e.g., 10000 paise = 100.00 INR)
         parsedAmount = rzpPayment.amount >= 100 ? rzpPayment.amount / 100 : rzpPayment.amount;
       } else {
         const amountVal = callbackPayload.amount || 
@@ -452,18 +456,18 @@ export class PosPaymentController {
       const customerMobileVal = callbackPayload.customerMobileNumber || callbackPayload.customer_mobile || callbackPayload.customerMobile || rzpPayment?.contact || '';
       const customerEmailVal = callbackPayload.customerEmail || callbackPayload.customer_email || callbackPayload.email || rzpPayment?.email || rzpPayment?.vpa || '';
 
-      const key = `${targetP2pReqId}_${refNumber}_${rawStatus}`;
+      const dedupeKey = `${rzpPaymentId || targetP2pReqId || refNumber}_${eventType || rawStatus}`;
 
       // Idempotency Check: Don't re-process exact duplicate callback
-      if (memoryPosCallbacks.has(key)) {
-        console.log(`ℹ️ [POS Callback] Duplicate callback received for key: ${key}. Acknowledging HTTP 200.`);
+      if (memoryPosCallbacks.has(dedupeKey)) {
+        console.log(`ℹ️ [POS Callback] Duplicate callback received for key: ${dedupeKey}. Acknowledging HTTP 200.`);
         return res.status(200).json({
           success: true,
           message: 'Callback already processed (Idempotent).'
         });
       }
 
-      memoryPosCallbacks.add(key);
+      memoryPosCallbacks.add(dedupeKey);
 
       // Audit Log into Database
       if (sql) {
@@ -471,66 +475,83 @@ export class PosPaymentController {
           await initializeNeonDatabase();
           await sql`
             INSERT INTO pos_callbacks (p2p_request_id, external_ref_number, status, payload)
-            VALUES (${targetP2pReqId}, ${refNumber}, ${rawStatus || 'COMPLETED'}, ${JSON.stringify(callbackPayload)});
+            VALUES (${targetP2pReqId || rzpPaymentId}, ${refNumber}, ${eventType || rawStatus || 'COMPLETED'}, ${JSON.stringify(callbackPayload)});
           `;
         } catch (dbErr) {
           console.error('Neon DB callback audit error:', dbErr);
         }
       }
 
-      // Determine mapped status
-      let finalStatus = 'SUCCESS';
+      // Determine Status mapping based on Event Type & Status
+      // Primary SUCCESS event: payment.captured, qr_code.credited, CAPTURED, AUTHORIZED, SUCCESS
+      let isSuccessEvent = false;
+      let isFailedEvent = false;
+
       if (
-        rawStatus.includes('AUTHORIZED') || 
+        eventType === 'payment.captured' || 
+        eventType === 'qr_code.credited' || 
+        rawStatus.includes('CAPTURED') || 
         rawStatus.includes('SUCCESS') || 
         rawStatus.includes('COMPLETED') || 
         rawStatus.includes('DONE') || 
         rawStatus.includes('0000') || 
-        rawStatus.includes('PAID') || 
-        rawStatus.includes('CAPTURED') ||
-        eventType.includes('CAPTURED') ||
-        eventType.includes('CREDITED') ||
-        eventType.includes('AUTHORIZED')
+        rawStatus.includes('PAID')
       ) {
-        finalStatus = 'SUCCESS';
+        isSuccessEvent = true;
       } else if (
+        eventType === 'payment.failed' || 
         rawStatus.includes('FAIL') || 
         rawStatus.includes('DECLINED') || 
         rawStatus.includes('ERROR') || 
-        rawStatus.includes('REJECTED') ||
-        eventType.includes('FAILED')
+        rawStatus.includes('REJECTED')
       ) {
-        finalStatus = 'FAILED';
-      } else if (
-        rawStatus.includes('CANCEL')
-      ) {
-        finalStatus = 'CANCELLED';
+        isFailedEvent = true;
       }
 
-      // UPSERT Transaction in DB
+      let finalStatus = isSuccessEvent ? 'SUCCESS' : isFailedEvent ? 'FAILED' : 'PENDING';
+
+      // SINGLE-ROW UPSERT Logic in Database
       let transactionId = `TXN_${Date.now()}_${Math.floor(100 + Math.random() * 900)}`;
 
       if (sql) {
         try {
           await initializeNeonDatabase();
-          // First attempt UPDATE
-          const updateRes = await sql`
-            UPDATE pos_transactions
-            SET 
-              status = ${finalStatus}, 
-              p2p_request_id = CASE WHEN ${targetP2pReqId} != '' THEN ${targetP2pReqId} ELSE p2p_request_id END,
-              amount = CASE WHEN ${parsedAmount} > 0 THEN ${parsedAmount} ELSE amount END,
-              final_status_response = ${JSON.stringify(callbackPayload)}, 
-              updated_at = NOW()
-            WHERE (p2p_request_id IS NOT NULL AND p2p_request_id != '' AND p2p_request_id = ${targetP2pReqId}) 
+          // First check if an existing transaction record matches by payment_id, p2p_request_id, or external_ref_number
+          const existingRows = await sql`
+            SELECT id, transaction_id, status, amount
+            FROM pos_transactions
+            WHERE (p2p_request_id IS NOT NULL AND p2p_request_id != '' AND p2p_request_id = ${targetP2pReqId})
+               OR (transaction_id = ${rzpPaymentId} OR p2p_request_id = ${rzpPaymentId})
                OR external_ref_number = ${refNumber}
-            RETURNING transaction_id;
+               OR (final_status_response->'payload'->'payment'->'entity'->>'id' = ${rzpPaymentId} AND ${rzpPaymentId} != '')
+            LIMIT 1;
           `;
 
-          if (updateRes.length > 0) {
-            transactionId = updateRes[0].transaction_id;
+          if (existingRows.length > 0) {
+            const existing = existingRows[0];
+            transactionId = existing.transaction_id;
+            
+            // Don't downgrade status if existing is already SUCCESS / CAPTURED
+            const newStatus = (existing.status === 'SUCCESS' || existing.status === 'CAPTURED') ? existing.status : finalStatus;
+            const newAmount = parsedAmount > 0 ? parsedAmount : parseFloat(existing.amount);
+
+            await sql`
+              UPDATE pos_transactions
+              SET 
+                status = ${newStatus}, 
+                p2p_request_id = CASE WHEN ${targetP2pReqId} != '' THEN ${targetP2pReqId} ELSE p2p_request_id END,
+                amount = ${newAmount},
+                payment_mode = ${paymentModeVal},
+                customer_email = CASE WHEN ${customerEmailVal} != '' THEN ${customerEmailVal} ELSE customer_email END,
+                customer_mobile = CASE WHEN ${customerMobileVal} != '' THEN ${customerMobileVal} ELSE customer_mobile END,
+                device_id = CASE WHEN ${deviceIdVal} != 'POS_DEVICE' THEN ${deviceIdVal} ELSE device_id END,
+                final_status_response = ${JSON.stringify(callbackPayload)}, 
+                updated_at = NOW()
+              WHERE id = ${existing.id};
+            `;
+            console.log(`✅ [POS Callback] Updated existing single-row transaction ID ${existing.id} (${refNumber}) -> Status: ${newStatus}, Amount: ₹${newAmount}`);
           } else {
-            // Transaction was NOT found in DB, perform INSERT (UPSERT)
+            // New Single-Row Transaction
             await sql`
               INSERT INTO pos_transactions (
                 transaction_id, order_id, external_ref_number, p2p_request_id, amount, payment_mode, device_id, status, customer_mobile, customer_email, final_status_response
@@ -538,7 +559,7 @@ export class PosPaymentController {
                 ${transactionId}, ${refNumber}, ${refNumber}, ${targetP2pReqId}, ${parsedAmount}, ${paymentModeVal}, ${deviceIdVal}, ${finalStatus}, ${customerMobileVal}, ${customerEmailVal}, ${JSON.stringify(callbackPayload)}
               );
             `;
-            console.log(`✨ [POS Callback] New transaction record created from callback: ${refNumber} (Amount: ${parsedAmount}, Status: ${finalStatus})`);
+            console.log(`✨ [POS Callback] Created new single-row transaction record: ${refNumber} (Amount: ₹${parsedAmount}, Status: ${finalStatus})`);
           }
         } catch (dbErr) {
           console.error('Neon DB callback transaction upsert error:', dbErr);
@@ -546,9 +567,12 @@ export class PosPaymentController {
       }
 
       // Update / Insert into Memory Fallback Store
-      const existingMemRecord = memoryPosTransactions.get(targetP2pReqId) || memoryPosTransactions.get(refNumber);
+      const memKey = rzpPaymentId || targetP2pReqId || refNumber;
+      const existingMemRecord = memoryPosTransactions.get(memKey) || memoryPosTransactions.get(refNumber);
       if (existingMemRecord) {
-        existingMemRecord.status = finalStatus;
+        if (existingMemRecord.status !== 'SUCCESS') {
+          existingMemRecord.status = finalStatus;
+        }
         if (targetP2pReqId) existingMemRecord.p2pRequestId = targetP2pReqId;
         if (parsedAmount > 0) existingMemRecord.amount = parsedAmount;
         existingMemRecord.finalStatusResponse = callbackPayload;
@@ -576,12 +600,11 @@ export class PosPaymentController {
         if (targetP2pReqId) memoryPosTransactions.set(targetP2pReqId, newMemRecord);
       }
 
-      console.log(`✅ [POS Callback] Processed callback for ${refNumber} -> Final Status: ${finalStatus}`);
+      console.log(`✅ [POS Callback] Processed event ${eventType || rawStatus} for ${refNumber} -> Final Status: ${finalStatus}`);
 
-      // Always return HTTP 200 to acknowledge Ezetap server-to-server webhook
       return res.status(200).json({
         success: true,
-        message: 'POS callback received and acknowledged successfully.',
+        message: 'POS callback processed and acknowledged successfully.',
         externalRefNumber: refNumber,
         status: finalStatus
       });
