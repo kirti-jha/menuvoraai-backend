@@ -463,7 +463,19 @@ export class PosPaymentController {
                         `ORD_POS_${Date.now()}`;
 
       const rawStatus = (callbackPayload.status || callbackPayload.txnStatus || callbackPayload.messageCode || callbackPayload.responseCode || '').toString().toUpperCase();
-      const amountVal = callbackPayload.amount || callbackPayload.txnAmount || callbackPayload.totalAmount || 0;
+      const amountVal = callbackPayload.amount || 
+                        callbackPayload.txnAmount || 
+                        callbackPayload.totalAmount || 
+                        callbackPayload.chargeAmount || 
+                        callbackPayload.formattedAmount || 
+                        callbackPayload.amountInRupees || 
+                        callbackPayload.data?.amount || 
+                        callbackPayload.data?.txnAmount || 
+                        0;
+
+      const cleanedAmountStr = String(amountVal).replace(/[^0-9.]/g, '');
+      const parsedAmount = parseFloat(cleanedAmountStr) || 0;
+
       const paymentModeVal = (callbackPayload.paymentMode || callbackPayload.payment_mode || callbackPayload.mode || 'CARD').toString().toUpperCase();
       const deviceIdVal = callbackPayload.deviceId || callbackPayload.device_id || callbackPayload.pushTo?.deviceId || 'POS_DEVICE';
       const customerMobileVal = callbackPayload.customerMobileNumber || callbackPayload.customer_mobile || callbackPayload.customerMobile || '';
@@ -532,6 +544,7 @@ export class PosPaymentController {
             SET 
               status = ${finalStatus}, 
               p2p_request_id = CASE WHEN ${targetP2pReqId} != '' THEN ${targetP2pReqId} ELSE p2p_request_id END,
+              amount = CASE WHEN ${parsedAmount} > 0 THEN ${parsedAmount} ELSE amount END,
               final_status_response = ${JSON.stringify(callbackPayload)}, 
               updated_at = NOW()
             WHERE (p2p_request_id IS NOT NULL AND p2p_request_id != '' AND p2p_request_id = ${targetP2pReqId}) 
@@ -547,10 +560,10 @@ export class PosPaymentController {
               INSERT INTO pos_transactions (
                 transaction_id, order_id, external_ref_number, p2p_request_id, amount, payment_mode, device_id, status, customer_mobile, customer_email, final_status_response
               ) VALUES (
-                ${transactionId}, ${refNumber}, ${refNumber}, ${targetP2pReqId}, ${parseFloat(amountVal) || 0}, ${paymentModeVal}, ${deviceIdVal}, ${finalStatus}, ${customerMobileVal}, ${customerEmailVal}, ${JSON.stringify(callbackPayload)}
+                ${transactionId}, ${refNumber}, ${refNumber}, ${targetP2pReqId}, ${parsedAmount}, ${paymentModeVal}, ${deviceIdVal}, ${finalStatus}, ${customerMobileVal}, ${customerEmailVal}, ${JSON.stringify(callbackPayload)}
               );
             `;
-            console.log(`✨ [POS Callback] New transaction record created from callback: ${refNumber} (Status: ${finalStatus})`);
+            console.log(`✨ [POS Callback] New transaction record created from callback: ${refNumber} (Amount: ${parsedAmount}, Status: ${finalStatus})`);
           }
         } catch (dbErr) {
           console.error('Neon DB callback transaction upsert error:', dbErr);
@@ -562,6 +575,7 @@ export class PosPaymentController {
       if (existingMemRecord) {
         existingMemRecord.status = finalStatus;
         if (targetP2pReqId) existingMemRecord.p2pRequestId = targetP2pReqId;
+        if (parsedAmount > 0) existingMemRecord.amount = parsedAmount;
         existingMemRecord.finalStatusResponse = callbackPayload;
         existingMemRecord.updatedAt = getISTISOString();
         memoryPosTransactions.set(existingMemRecord.transactionId, existingMemRecord);
@@ -572,7 +586,7 @@ export class PosPaymentController {
           orderId: refNumber,
           externalRefNumber: refNumber,
           p2pRequestId: targetP2pReqId,
-          amount: parseFloat(amountVal) || 0,
+          amount: parsedAmount,
           paymentMode: paymentModeVal,
           deviceId: deviceIdVal,
           status: finalStatus,
@@ -647,11 +661,13 @@ export class PosPaymentController {
         transactions = Array.from(uniqueMemTxns.values());
       }
 
-      // Format all timestamps into Indian Standard Time (IST)
+      // Format all timestamps into Indian Standard Time (IST) & parse numeric float amount
       const formattedTransactions = transactions.map((item: any) => {
         const rawTime = item.timestamp || item.createdAt || item.created_at;
+        const numAmount = parseFloat(item.amount);
         return {
           ...item,
+          amount: isNaN(numAmount) ? 0 : numAmount,
           timestamp: getISTISOString(rawTime),
           formattedTimeIST: getISTTimestamp(rawTime)
         };
