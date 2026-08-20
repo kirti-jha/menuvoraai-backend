@@ -6,8 +6,8 @@ dotenv.config();
 
 function getEzetapConfig() {
   return {
-    username: process.env.EZETAP_USERNAME || '7026424846',
-    appKey: process.env.EZETAP_APP_KEY || '8cfae0b9-1396-4561-ab49-820c08ec9c7e',
+    username: process.env.EZETAP_USERNAME || '5600430356',
+    appKey: process.env.EZETAP_APP_KEY || '765e9d3b-cf13-4aac-94b9-3646d9fe13e3',
     baseUrl: (process.env.EZETAP_BASE_URL || 'https://demo.ezetap.com').replace(/\/$/, '')
   };
 }
