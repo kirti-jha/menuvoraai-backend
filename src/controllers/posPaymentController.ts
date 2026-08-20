@@ -4,6 +4,46 @@ import path from 'path';
 import { EzetapService } from '../services/ezetapService';
 import { sql, initializeNeonDatabase } from '../config/neon';
 
+/**
+ * Format a Date or Date String into Indian Standard Time (IST)
+ * Format e.g.: "20/08/2026, 10:58:17 am IST"
+ */
+export function getISTTimestamp(dateInput?: Date | string | null): string {
+  const date = dateInput ? new Date(dateInput) : new Date();
+  if (isNaN(date.getTime())) return new Date().toISOString() + ' IST';
+  return date.toLocaleString('en-IN', {
+    timeZone: 'Asia/Kolkata',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: true
+  }) + ' IST';
+}
+
+/**
+ * Format Date into IST ISO-style string e.g. "2026-08-20T10:58:17+05:30"
+ */
+export function getISTISOString(dateInput?: Date | string | null): string {
+  const date = dateInput ? new Date(dateInput) : new Date();
+  if (isNaN(date.getTime())) return new Date().toISOString();
+  // IST is UTC + 5:30 (+330 minutes)
+  const utc = date.getTime() + (date.getTimezoneOffset() * 60000);
+  const istDate = new Date(utc + (330 * 60000));
+  
+  const pad = (n: number) => n.toString().padStart(2, '0');
+  const year = istDate.getFullYear();
+  const month = pad(istDate.getMonth() + 1);
+  const day = pad(istDate.getDate());
+  const hours = pad(istDate.getHours());
+  const minutes = pad(istDate.getMinutes());
+  const seconds = pad(istDate.getSeconds());
+  
+  return `${year}-${month}-${day}T${hours}:${minutes}:${seconds}+05:30`;
+}
+
 // Helper function to log EVERY incoming callback request to disk file: logs/pos_callbacks.log
 function writeCallbackLog(req: Request) {
   try {
@@ -12,11 +52,11 @@ function writeCallbackLog(req: Request) {
       fs.mkdirSync(logDir, { recursive: true });
     }
     const logFilePath = path.join(logDir, 'pos_callbacks.log');
-    const timestamp = new Date().toISOString();
+    const timestamp = `${getISTTimestamp()} (${getISTISOString()})`;
     const clientIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'UNKNOWN';
 
     const logEntry = `--------------------------------------------------------------------------------
-[CALLBACK RECEIVED] ${timestamp}
+[CALLBACK RECEIVED IST] ${timestamp}
 Method: ${req.method}
 URL: ${req.originalUrl || req.url}
 Client IP: ${clientIp}
@@ -102,8 +142,8 @@ export class PosPaymentController {
         status: 'PENDING',
         customerMobileNumber,
         customerEmail,
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString()
+        createdAt: getISTISOString(),
+        updatedAt: getISTISOString()
       });
       memoryPosTransactions.set(refNumber, memoryPosTransactions.get(transactionId));
 
@@ -505,7 +545,7 @@ export class PosPaymentController {
         existingMemRecord.status = finalStatus;
         if (targetP2pReqId) existingMemRecord.p2pRequestId = targetP2pReqId;
         existingMemRecord.finalStatusResponse = callbackPayload;
-        existingMemRecord.updatedAt = new Date().toISOString();
+        existingMemRecord.updatedAt = getISTISOString();
         memoryPosTransactions.set(existingMemRecord.transactionId, existingMemRecord);
         memoryPosTransactions.set(refNumber, existingMemRecord);
       } else {
@@ -521,8 +561,8 @@ export class PosPaymentController {
           customerMobileNumber: customerMobileVal,
           customerEmail: customerEmailVal,
           finalStatusResponse: callbackPayload,
-          createdAt: new Date().toISOString(),
-          updatedAt: new Date().toISOString()
+          createdAt: getISTISOString(),
+          updatedAt: getISTISOString()
         };
         memoryPosTransactions.set(transactionId, newMemRecord);
         memoryPosTransactions.set(refNumber, newMemRecord);
@@ -588,10 +628,21 @@ export class PosPaymentController {
         }
         transactions = Array.from(uniqueMemTxns.values());
       }
+
+      // Format all timestamps into Indian Standard Time (IST)
+      const formattedTransactions = transactions.map((item: any) => {
+        const rawTime = item.timestamp || item.createdAt || item.created_at;
+        return {
+          ...item,
+          timestamp: getISTISOString(rawTime),
+          formattedTimeIST: getISTTimestamp(rawTime)
+        };
+      });
+
       return res.json({
         success: true,
-        count: transactions.length,
-        data: transactions
+        count: formattedTransactions.length,
+        data: formattedTransactions
       });
     } catch (err: any) {
       console.error('Fetch POS Transactions Error:', err);
