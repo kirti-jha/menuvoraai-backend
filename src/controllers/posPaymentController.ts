@@ -679,23 +679,35 @@ export class PosPaymentController {
         transactions = Array.from(uniqueMemTxns.values());
       }
 
-      // Format all timestamps into Indian Standard Time (IST) & parse numeric float amount
+      // Format all timestamps into Indian Standard Time (IST) & parse metadata + rawLog
       const formattedTransactions = transactions.map((item: any) => {
         const rawTime = item.timestamp || item.createdAt || item.created_at;
         const numAmount = parseFloat(item.amount);
-        const resp = item.finalStatusResponse || item.final_status_response || {};
+        const resp = item.finalStatusResponse || item.final_status_response || item.initiationResponse || item.initiation_response || {};
         const rzpEntity = resp.payload?.payment?.entity || resp.payment?.entity;
         
         const paymentId = rzpEntity?.id || item.transactionId || item.p2pRequestId || 'N/A';
         const bankRrn = rzpEntity?.acquirer_data?.rrn || resp.rrn || resp.bankRrn || 'N/A';
+        const custName = item.customerName || rzpEntity?.notes?.username || (item.customerEmail ? item.customerEmail.split('@')[0] : 'POS Customer');
+        const custEmail = item.customerEmail || rzpEntity?.email || rzpEntity?.vpa || '';
+        const custMobile = item.customerMobileNumber || rzpEntity?.contact || '';
 
         return {
-          ...item,
+          transactionId: item.transactionId,
+          orderId: item.orderId || item.externalRefNumber,
+          externalRefNumber: item.externalRefNumber,
+          customerName: custName,
+          customerEmail: custEmail,
+          customerMobileNumber: custMobile,
+          amount: isNaN(numAmount) ? 0 : numAmount,
+          paymentMode: item.paymentMode || rzpEntity?.method || 'CARD',
+          deviceId: item.deviceId || rzpEntity?.device_id || 'POS_DEVICE',
+          status: item.status,
+          timestamp: getISTISOString(rawTime),
+          formattedTimeIST: getISTTimestamp(rawTime),
           paymentId,
           bankRrn,
-          amount: isNaN(numAmount) ? 0 : numAmount,
-          timestamp: getISTISOString(rawTime),
-          formattedTimeIST: getISTTimestamp(rawTime)
+          rawLog: resp
         };
       });
 
