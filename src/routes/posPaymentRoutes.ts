@@ -13,6 +13,7 @@ router.all('/payments/pos/callback', PosPaymentController.handleCallback);
 router.get('/payments/pos/transactions', PosPaymentController.listTransactions);
 router.get('/payments/pos/callback-logs', PosPaymentController.getCallbackLogs);
 router.get('/payments/pos/api-logs', PosPaymentController.getApiLogs);
+router.all('/payments/pos/clear', PosPaymentController.clearTransactions);
 router.get('/payments/:transactionId/status', PosPaymentController.getInternalStatus);
 
 export default router;

@@ -761,4 +761,25 @@ export class PosPaymentController {
       });
     }
   }
+
+  /**
+   * Clear All POS Transactions & Memory Logs (For Testing Clean Slate)
+   * Endpoint: ALL /api/payments/pos/clear
+   */
+  static async clearTransactions(req: Request, res: Response) {
+    try {
+      if (sql) {
+        await initializeNeonDatabase();
+        await sql`TRUNCATE TABLE pos_transactions, pos_callbacks RESTART IDENTITY;`;
+      }
+      memoryPosTransactions.clear();
+      memoryPosCallbacks.clear();
+      return res.json({
+        success: true,
+        message: 'All POS transaction records and callback logs cleared successfully.'
+      });
+    } catch (err: any) {
+      return res.status(500).json({ success: false, message: 'Failed to clear transactions.' });
+    }
+  }
 }
