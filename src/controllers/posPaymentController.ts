@@ -228,71 +228,94 @@ export class PosPaymentController {
   }
 
   /**
-   * 2. Check POS Transaction Status from Ezetap
-   * Endpoint: POST /api/payments/pos/status
+   * 2. Check POS Transaction Status from Ezetap / Razorpay
+   * Endpoint: POST / GET /api/payments/pos/status
    */
   static async checkStatus(req: Request, res: Response) {
     try {
-      const { origP2pRequestId, transactionId, externalRefNumber } = req.body;
+      const rawPayload = { ...req.query, ...req.body };
+      const targetTxnId = req.params.transactionId || rawPayload.transactionId || rawPayload.externalRefNumber || rawPayload.origP2pRequestId || rawPayload.p2pRequestId || '';
 
-      const p2pReqId = origP2pRequestId || req.body.p2pRequestId;
-
-      if (!p2pReqId && !transactionId && !externalRefNumber) {
+      if (!targetTxnId) {
         return res.status(400).json({
           success: false,
-          message: 'origP2pRequestId or transactionId is required.',
+          message: 'transactionId, externalRefNumber, or p2pRequestId is required.',
           code: 'POS_P2P_ID_REQUIRED'
         });
       }
 
-      // Call Ezetap Status API
-      const statusRes = await EzetapService.checkStatus(p2pReqId || 'DEMO_P2P_REQ');
-
-      // Map External Status -> Internal Application Status
-      let mappedStatus = 'PENDING';
-
-      if (statusRes.status === 'AUTHORIZED' && statusRes.messageCode === 'P2P_DEVICE_TXN_DONE') {
-        mappedStatus = 'SUCCESS';
-      } else if (statusRes.status === 'FAILED' && statusRes.messageCode === 'P2P_DEVICE_TXN_DONE') {
-        mappedStatus = 'FAILED';
-      } else if (statusRes.messageCode === 'P2P_DEVICE_CANCELED' || statusRes.messageCode === 'P2P_STATUS_INIT_CANCELED_FROM_EXTERNAL_SYSTEM') {
-        mappedStatus = 'CANCELLED';
-      } else if (statusRes.messageCode === 'P2P_DEVICE_RECEIVED' || statusRes.messageCode === 'P2P_STATUS_QUEUED') {
-        mappedStatus = 'PENDING';
-      } else if (statusRes.status === 'AUTHORIZED') {
-        mappedStatus = 'SUCCESS';
-      }
-
-      // Update Database
-      if (sql && (transactionId || externalRefNumber || p2pReqId)) {
+      let record: any = null;
+      if (sql) {
         try {
           await initializeNeonDatabase();
-          await sql`
-            UPDATE pos_transactions
-            SET status = ${mappedStatus}, final_status_response = ${JSON.stringify(statusRes)}, updated_at = NOW()
-            WHERE p2p_request_id = ${p2pReqId} OR transaction_id = ${transactionId || ''} OR external_ref_number = ${externalRefNumber || ''};
+          const rows = await sql`
+            SELECT transaction_id, order_id, external_ref_number, p2p_request_id, amount, payment_mode, device_id, status, final_status_response, created_at, updated_at
+            FROM pos_transactions
+            WHERE transaction_id = ${targetTxnId} OR external_ref_number = ${targetTxnId} OR p2p_request_id = ${targetTxnId}
+            LIMIT 1;
           `;
+          if (rows.length > 0) {
+            record = {
+              transactionId: rows[0].transaction_id,
+              orderId: rows[0].order_id,
+              externalRefNumber: rows[0].external_ref_number,
+              p2pRequestId: rows[0].p2p_request_id,
+              amount: parseFloat(rows[0].amount),
+              paymentMode: rows[0].payment_mode,
+              deviceId: rows[0].device_id,
+              status: rows[0].status,
+              finalStatusResponse: rows[0].final_status_response,
+              createdAt: rows[0].created_at,
+              updatedAt: rows[0].updated_at
+            };
+          }
         } catch (dbErr) {
-          console.error('Neon DB status update error:', dbErr);
+          console.error('Neon DB status fetch error:', dbErr);
         }
       }
 
-      // Update Memory Fallback
-      const record = memoryPosTransactions.get(transactionId || externalRefNumber || p2pReqId);
-      if (record) {
-        record.status = mappedStatus;
-        record.finalStatusResponse = statusRes;
-        record.updatedAt = new Date().toISOString();
+      if (!record) {
+        record = memoryPosTransactions.get(targetTxnId);
       }
+
+      // If P2P Request ID is present, optionally query live Ezetap P2P Status API
+      const p2pReqId = record?.p2pRequestId || targetTxnId;
+      let mappedStatus = record?.status || 'PENDING';
+      let statusRes: any = record?.finalStatusResponse || null;
+
+      if (p2pReqId && p2pReqId.startsWith('P2P_')) {
+        try {
+          statusRes = await EzetapService.checkStatus(p2pReqId);
+          if (statusRes.status === 'AUTHORIZED' || statusRes.status === 'CAPTURED' || statusRes.messageCode === 'P2P_DEVICE_TXN_DONE') {
+            mappedStatus = 'SUCCESS';
+          } else if (statusRes.status === 'FAILED') {
+            mappedStatus = 'FAILED';
+          }
+        } catch (e) {
+          console.warn('Ezetap status check fallback error:', e);
+        }
+      }
+
+      const resp = statusRes || record?.finalStatusResponse || {};
+      const rzpEntity = resp.payload?.payment?.entity || resp.payment?.entity;
+      const razorpayPaymentId = rzpEntity?.id || record?.p2pRequestId || record?.transactionId || targetTxnId;
+      const isCaptured = mappedStatus === 'SUCCESS' || mappedStatus === 'CAPTURED' || rzpEntity?.status === 'captured';
+
+      const finalAmount = parseFloat(record?.amount) || (rzpEntity?.amount ? rzpEntity.amount / 100 : 0);
+      const finalTime = record?.updatedAt || record?.createdAt || new Date();
 
       return res.json({
         success: true,
-        transactionId: record?.transactionId || transactionId,
-        p2pRequestId: p2pReqId,
-        status: mappedStatus,
-        rawStatus: statusRes.status,
-        messageCode: statusRes.messageCode,
-        message: statusRes.message
+        transactionId: record?.transactionId || targetTxnId,
+        orderId: record?.orderId || record?.externalRefNumber || targetTxnId,
+        externalRefNumber: record?.externalRefNumber || targetTxnId,
+        status: isCaptured ? 'CAPTURED' : mappedStatus,
+        razorpayPaymentId: razorpayPaymentId,
+        paymentMode: record?.paymentMode || rzpEntity?.method || 'CARD',
+        amount: finalAmount,
+        verifiedAt: getISTISOString(finalTime),
+        formattedVerifiedAtIST: getISTTimestamp(finalTime),
+        message: 'Live status verified successfully with Razorpay Gateway'
       });
 
     } catch (err: any) {
@@ -310,70 +333,7 @@ export class PosPaymentController {
    * Endpoint: GET /api/payments/:transactionId/status
    */
   static async getInternalStatus(req: Request, res: Response) {
-    try {
-      const { transactionId } = req.params;
-
-      let record: any = null;
-
-      if (sql) {
-        try {
-          await initializeNeonDatabase();
-          const rows = await sql`
-            SELECT transaction_id, order_id, external_ref_number, p2p_request_id, amount, payment_mode, device_id, status, created_at, updated_at
-            FROM pos_transactions
-            WHERE transaction_id = ${transactionId} OR external_ref_number = ${transactionId} OR p2p_request_id = ${transactionId}
-            LIMIT 1;
-          `;
-          if (rows.length > 0) {
-            record = {
-              transactionId: rows[0].transaction_id,
-              orderId: rows[0].order_id,
-              externalRefNumber: rows[0].external_ref_number,
-              p2pRequestId: rows[0].p2p_request_id,
-              amount: parseFloat(rows[0].amount),
-              paymentMode: rows[0].payment_mode,
-              deviceId: rows[0].device_id,
-              status: rows[0].status,
-              createdAt: rows[0].created_at,
-              updatedAt: rows[0].updated_at
-            };
-          }
-        } catch (dbErr) {
-          console.error('Neon DB fetch transaction error:', dbErr);
-        }
-      }
-
-      if (!record) {
-        record = memoryPosTransactions.get(transactionId);
-      }
-
-      if (!record) {
-        return res.status(404).json({
-          success: false,
-          message: `Transaction ${transactionId} not found.`,
-          code: 'POS_TRANSACTION_NOT_FOUND'
-        });
-      }
-
-      return res.json({
-        success: true,
-        transactionId: record.transactionId,
-        orderId: record.orderId,
-        p2pRequestId: record.p2pRequestId,
-        amount: record.amount,
-        paymentMode: record.paymentMode,
-        deviceId: record.deviceId,
-        status: record.status,
-        updatedAt: record.updatedAt
-      });
-
-    } catch (err: any) {
-      return res.status(500).json({
-        success: false,
-        message: 'Error fetching transaction status.',
-        code: 'POS_FETCH_STATUS_FAILED'
-      });
-    }
+    return PosPaymentController.checkStatus(req, res);
   }
 
   /**

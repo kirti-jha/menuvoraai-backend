@@ -5,7 +5,7 @@ const router = Router();
 
 // POS Bridge API Routes
 router.post('/payments/pos/initiate', PosPaymentController.initiate);
-router.post('/payments/pos/status', PosPaymentController.checkStatus);
+router.all('/payments/pos/status', PosPaymentController.checkStatus);
 router.post('/payments/pos/cancel', PosPaymentController.cancel);
 router.all('/payments/pos/callback', PosPaymentController.handleCallback);
 
