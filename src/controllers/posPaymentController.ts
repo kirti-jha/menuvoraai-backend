@@ -446,13 +446,15 @@ export class PosPaymentController {
       const rawPayload = { ...req.query, ...req.body };
       const nestedData = rawPayload.data || rawPayload.response || rawPayload.payload || rawPayload.txnReport || {};
       const callbackPayload = { ...rawPayload, ...nestedData };
+      const rzpPayment = rawPayload.payload?.payment?.entity || callbackPayload.payload?.payment?.entity || callbackPayload.payment?.entity;
 
-      // Flexible extraction of IDs and Fields from Ezetap / Razorpay POS callback payloads
+      // Flexible extraction of IDs and Fields from Ezetap / Razorpay POS callback webhooks
       const targetP2pReqId = callbackPayload.p2pRequestId || 
                              callbackPayload.origP2pRequestId || 
                              callbackPayload.p2p_request_id || 
                              callbackPayload.requestId || 
                              callbackPayload.txnId || 
+                             rzpPayment?.id ||
                              '';
 
       const refNumber = callbackPayload.externalRefNumber || 
@@ -460,26 +462,35 @@ export class PosPaymentController {
                         callbackPayload.orderId || 
                         callbackPayload.order_id || 
                         callbackPayload.refNumber || 
+                        rzpPayment?.order_id ||
                         `ORD_POS_${Date.now()}`;
 
-      const rawStatus = (callbackPayload.status || callbackPayload.txnStatus || callbackPayload.messageCode || callbackPayload.responseCode || '').toString().toUpperCase();
-      const amountVal = callbackPayload.amount || 
-                        callbackPayload.txnAmount || 
-                        callbackPayload.totalAmount || 
-                        callbackPayload.chargeAmount || 
-                        callbackPayload.formattedAmount || 
-                        callbackPayload.amountInRupees || 
-                        callbackPayload.data?.amount || 
-                        callbackPayload.data?.txnAmount || 
-                        0;
+      const eventType = (callbackPayload.event || '').toString().toUpperCase();
+      const rawStatus = (callbackPayload.status || callbackPayload.txnStatus || callbackPayload.messageCode || callbackPayload.responseCode || rzpPayment?.status || eventType || '').toString().toUpperCase();
 
-      const cleanedAmountStr = String(amountVal).replace(/[^0-9.]/g, '');
-      const parsedAmount = parseFloat(cleanedAmountStr) || 0;
+      let parsedAmount = 0;
+      if (rzpPayment && rzpPayment.amount !== undefined && rzpPayment.amount !== null) {
+        // Razorpay webhooks pass amount in paise (e.g., 10000 paise = 100.00 INR)
+        parsedAmount = rzpPayment.amount >= 100 ? rzpPayment.amount / 100 : rzpPayment.amount;
+      } else {
+        const amountVal = callbackPayload.amount || 
+                          callbackPayload.txnAmount || 
+                          callbackPayload.totalAmount || 
+                          callbackPayload.chargeAmount || 
+                          callbackPayload.formattedAmount || 
+                          callbackPayload.amountInRupees || 
+                          callbackPayload.data?.amount || 
+                          callbackPayload.data?.txnAmount || 
+                          0;
 
-      const paymentModeVal = (callbackPayload.paymentMode || callbackPayload.payment_mode || callbackPayload.mode || 'CARD').toString().toUpperCase();
-      const deviceIdVal = callbackPayload.deviceId || callbackPayload.device_id || callbackPayload.pushTo?.deviceId || 'POS_DEVICE';
-      const customerMobileVal = callbackPayload.customerMobileNumber || callbackPayload.customer_mobile || callbackPayload.customerMobile || '';
-      const customerEmailVal = callbackPayload.customerEmail || callbackPayload.customer_email || callbackPayload.email || '';
+        const cleanedAmountStr = String(amountVal).replace(/[^0-9.]/g, '');
+        parsedAmount = parseFloat(cleanedAmountStr) || 0;
+      }
+
+      const paymentModeVal = (callbackPayload.paymentMode || callbackPayload.payment_mode || callbackPayload.mode || rzpPayment?.method || 'CARD').toString().toUpperCase();
+      const deviceIdVal = callbackPayload.deviceId || callbackPayload.device_id || callbackPayload.pushTo?.deviceId || rzpPayment?.device_id || 'POS_DEVICE';
+      const customerMobileVal = callbackPayload.customerMobileNumber || callbackPayload.customer_mobile || callbackPayload.customerMobile || rzpPayment?.contact || '';
+      const customerEmailVal = callbackPayload.customerEmail || callbackPayload.customer_email || callbackPayload.email || rzpPayment?.email || rzpPayment?.vpa || '';
 
       const key = `${targetP2pReqId}_${refNumber}_${rawStatus}`;
 
@@ -516,14 +527,18 @@ export class PosPaymentController {
         rawStatus.includes('DONE') || 
         rawStatus.includes('0000') || 
         rawStatus.includes('PAID') || 
-        rawStatus.includes('CAPTURED')
+        rawStatus.includes('CAPTURED') ||
+        eventType.includes('CAPTURED') ||
+        eventType.includes('CREDITED') ||
+        eventType.includes('AUTHORIZED')
       ) {
         finalStatus = 'SUCCESS';
       } else if (
         rawStatus.includes('FAIL') || 
         rawStatus.includes('DECLINED') || 
         rawStatus.includes('ERROR') || 
-        rawStatus.includes('REJECTED')
+        rawStatus.includes('REJECTED') ||
+        eventType.includes('FAILED')
       ) {
         finalStatus = 'FAILED';
       } else if (
