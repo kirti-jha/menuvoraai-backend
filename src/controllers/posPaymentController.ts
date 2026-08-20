@@ -158,15 +158,33 @@ export class PosPaymentController {
         deviceId
       });
 
-      if (!ezetapRes.success && ezetapRes.errorCode) {
+      if (!ezetapRes.success || !ezetapRes.p2pRequestId) {
+        if (sql) {
+          try {
+            await sql`
+              UPDATE pos_transactions 
+              SET status = 'FAILED', initiation_response = ${JSON.stringify(ezetapRes)}, updated_at = NOW()
+              WHERE transaction_id = ${transactionId} OR external_ref_number = ${refNumber};
+            `;
+          } catch (dbErr) {
+            console.error('Neon DB update initiation failure error:', dbErr);
+          }
+        }
+        const record = memoryPosTransactions.get(transactionId);
+        if (record) {
+          record.status = 'FAILED';
+          record.initiationResponse = ezetapRes;
+        }
+
         return res.status(400).json({
           success: false,
-          message: ezetapRes.errorMessage || 'Unable to initiate POS payment',
-          code: ezetapRes.errorCode || 'POS_PAYMENT_INITIATION_FAILED'
+          message: ezetapRes.errorMessage || ezetapRes.message || 'Unable to initiate POS payment on Ezetap device.',
+          code: ezetapRes.errorCode || ezetapRes.messageCode || 'POS_PAYMENT_INITIATION_FAILED',
+          rawResponse: ezetapRes
         });
       }
 
-      const p2pRequestId = ezetapRes.p2pRequestId || `P2P_${Date.now()}`;
+      const p2pRequestId = ezetapRes.p2pRequestId;
 
       // Update record with p2pRequestId & initiation response
       if (sql) {
@@ -679,6 +697,30 @@ export class PosPaymentController {
       return res.status(500).json({
         success: false,
         message: 'Failed to read callback log file.'
+      });
+    }
+  }
+
+  /**
+   * View Outbound POS API Call Logs Endpoint
+   * Endpoint: GET /api/payments/pos/api-logs
+   */
+  static async getApiLogs(req: Request, res: Response) {
+    try {
+      const logFilePath = path.join(process.cwd(), 'logs', 'pos_api_calls.log');
+      if (!fs.existsSync(logFilePath)) {
+        return res.json({
+          success: true,
+          message: 'No POS API call logs recorded yet.',
+          logs: ''
+        });
+      }
+      const logs = fs.readFileSync(logFilePath, 'utf-8');
+      return res.type('text/plain').send(logs);
+    } catch (err: any) {
+      return res.status(500).json({
+        success: false,
+        message: 'Failed to read POS API log file.'
       });
     }
   }

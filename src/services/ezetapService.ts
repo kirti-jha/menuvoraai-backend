@@ -1,11 +1,39 @@
 import dotenv from 'dotenv';
+import fs from 'fs';
+import path from 'path';
 
 dotenv.config();
 
-// Environment Variables with Official Postman Demo Credentials as Defaults
-const EZETAP_USERNAME = process.env.EZETAP_USERNAME || '7026424846';
-const EZETAP_APP_KEY = process.env.EZETAP_APP_KEY || '8cfae0b9-1396-4561-ab49-820c08ec9c7e';
-const EZETAP_BASE_URL = (process.env.EZETAP_BASE_URL || 'https://demo.ezetap.com').replace(/\/$/, '');
+function getEzetapConfig() {
+  return {
+    username: process.env.EZETAP_USERNAME || '7026424846',
+    appKey: process.env.EZETAP_APP_KEY || '8cfae0b9-1396-4561-ab49-820c08ec9c7e',
+    baseUrl: (process.env.EZETAP_BASE_URL || 'https://demo.ezetap.com').replace(/\/$/, '')
+  };
+}
+
+function logEzetapApiCall(endpoint: string, requestPayload: any, responseData: any, httpStatus: number) {
+  try {
+    const logDir = path.join(process.cwd(), 'logs');
+    if (!fs.existsSync(logDir)) {
+      fs.mkdirSync(logDir, { recursive: true });
+    }
+    const logFilePath = path.join(logDir, 'pos_api_calls.log');
+    const timestamp = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }) + ' IST';
+    const logEntry = `--------------------------------------------------------------------------------
+[EZETAP POS OUTBOUND API CALL] ${timestamp}
+Endpoint: ${endpoint}
+HTTP Status: ${httpStatus}
+Request Payload: ${JSON.stringify(requestPayload, null, 2)}
+Response Payload: ${JSON.stringify(responseData, null, 2)}
+--------------------------------------------------------------------------------\n\n`;
+
+    fs.appendFileSync(logFilePath, logEntry, 'utf-8');
+    console.log(`📡 [Ezetap API Logger] Logged outbound call to ${endpoint}`);
+  } catch (err) {
+    console.error('❌ [Ezetap API Logger Error]:', err);
+  }
+}
 
 export interface InitiatePaymentParams {
   amount: number | string;
@@ -28,6 +56,7 @@ export interface EzetapInitiateResponse {
   errorCode?: string | null;
   errorMessage?: string | null;
   p2pRequestId?: string;
+  raw?: any;
 }
 
 export interface EzetapStatusResponse {
@@ -45,15 +74,16 @@ export class EzetapService {
    * Endpoint: POST /api/3.0/p2padapter/pay or /api/3.0/p2padapter/pa2
    */
   static async initiatePayment(params: InitiatePaymentParams): Promise<EzetapInitiateResponse> {
-    // Try primary Postman collection URL endpoint /api/3.0/p2padapter/pay first, fallback to /pa2
+    const config = getEzetapConfig();
     const endpoints = [
-      `${EZETAP_BASE_URL}/api/3.0/p2padapter/pay`,
-      `${EZETAP_BASE_URL}/api/3.0/p2padapter/pa2`
+      `${config.baseUrl}/api/3.0/p2padapter/pay`,
+      `${config.baseUrl}/api/3.0/p2padapter/pa2`,
+      `${config.baseUrl}/api/2.0/p2p/pay`
     ];
 
     const payload = {
-      appKey: EZETAP_APP_KEY,
-      username: EZETAP_USERNAME,
+      appKey: config.appKey,
+      username: config.username,
       amount: String(params.amount),
       externalRefNumber: params.externalRefNumber,
       customerEmail: params.customerEmail || 'test@gmail.com',
@@ -70,9 +100,11 @@ export class EzetapService {
     };
 
     let lastErrorMsg = 'Failed to connect to Ezetap / Razorpay POS API.';
+    let lastData: any = null;
+    let lastStatus = 500;
 
     for (const url of endpoints) {
-      console.log(`📡 [Ezetap Service] Requesting Live POS Pay API at ${url} for Ref: ${params.externalRefNumber}`);
+      console.log(`📡 [Ezetap Service] Calling Live POS Pay API at ${url} for Ref: ${params.externalRefNumber}`);
 
       try {
         const res = await fetch(url, {
@@ -81,25 +113,32 @@ export class EzetapService {
           body: JSON.stringify(payload),
         });
 
+        lastStatus = res.status;
         const data = (await res.json()) as EzetapInitiateResponse;
-        if (res.ok && data.success !== false) {
+        lastData = data;
+
+        logEzetapApiCall(url, payload, data, res.status);
+
+        if (res.ok && data.success !== false && data.p2pRequestId) {
           return data;
         }
 
-        if (data.errorMessage) {
-          lastErrorMsg = data.errorMessage;
+        if (data.errorMessage || data.message) {
+          lastErrorMsg = data.errorMessage || data.message || lastErrorMsg;
         }
       } catch (err: any) {
         console.warn(`⚠️ [Ezetap Service] HTTPS call to ${url} failed:`, err?.message || err);
+        logEzetapApiCall(url, payload, { error: err?.message || 'Connection Error' }, 500);
       }
     }
 
     return {
       success: false,
-      messageCode: 'POS_LIVE_API_ERROR',
+      messageCode: lastData?.messageCode || 'POS_LIVE_API_ERROR',
       message: lastErrorMsg,
-      errorCode: 'EZETAP_COMMUNICATION_FAILED',
+      errorCode: lastData?.errorCode || 'EZETAP_COMMUNICATION_FAILED',
       errorMessage: lastErrorMsg,
+      raw: lastData
     };
   }
 
@@ -108,16 +147,17 @@ export class EzetapService {
    * Endpoint: POST /api/3.0/p2padapter/status
    */
   static async checkStatus(origP2pRequestId: string): Promise<EzetapStatusResponse> {
-    const url = `${EZETAP_BASE_URL}/api/3.0/p2padapter/status`;
+    const config = getEzetapConfig();
+    const url = `${config.baseUrl}/api/3.0/p2padapter/status`;
 
     const payload = {
-      appKey: EZETAP_APP_KEY,
-      username: EZETAP_USERNAME,
+      appKey: config.appKey,
+      username: config.username,
       origP2pRequestId,
     };
 
     try {
-      console.log(`📡 [Ezetap Service] Querying Live Status at ${url} for P2P Req: ${origP2pRequestId}`);
+      console.log(`📡 [Ezetap Service] Querying Status at ${url} for P2P Req: ${origP2pRequestId}`);
       const res = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -125,12 +165,11 @@ export class EzetapService {
       });
 
       const data = (await res.json()) as EzetapStatusResponse;
-      if (res.ok) {
-        return data;
-      }
+      logEzetapApiCall(url, payload, data, res.status);
       return data;
     } catch (err: any) {
       console.warn(`⚠️ [Ezetap Service] Live status query error:`, err?.message || err);
+      logEzetapApiCall(url, payload, { error: err?.message || 'Connection error' }, 500);
       return {
         success: false,
         status: 'PENDING',
@@ -147,14 +186,15 @@ export class EzetapService {
    * Endpoint: POST /api/3.0/p2p/cancel or /api/3.0/p2padapter/cancel
    */
   static async cancelPayment(origP2pRequestId: string, deviceId: string): Promise<EzetapStatusResponse> {
+    const config = getEzetapConfig();
     const endpoints = [
-      `${EZETAP_BASE_URL}/api/3.0/p2p/cancel`,
-      `${EZETAP_BASE_URL}/api/3.0/p2padapter/cancel`
+      `${config.baseUrl}/api/3.0/p2p/cancel`,
+      `${config.baseUrl}/api/3.0/p2padapter/cancel`
     ];
 
     const payload = {
-      appKey: EZETAP_APP_KEY,
-      username: EZETAP_USERNAME,
+      appKey: config.appKey,
+      username: config.username,
       origP2pRequestId,
       pushTo: {
         deviceId,
@@ -163,7 +203,7 @@ export class EzetapService {
 
     for (const url of endpoints) {
       try {
-        console.log(`📡 [Ezetap Service] Sending Live Cancel Request to ${url}`);
+        console.log(`📡 [Ezetap Service] Sending Cancel Request to ${url}`);
         const res = await fetch(url, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -171,6 +211,7 @@ export class EzetapService {
         });
 
         const data = (await res.json()) as EzetapStatusResponse;
+        logEzetapApiCall(url, payload, data, res.status);
         if (res.ok) {
           return data;
         }
