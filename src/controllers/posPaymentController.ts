@@ -649,13 +649,16 @@ export class PosPaymentController {
           const rows = await sql`
             SELECT 
               transaction_id AS "transactionId",
+              order_id AS "orderId",
               external_ref_number AS "externalRefNumber",
+              p2p_request_id AS "p2pRequestId",
               customer_email AS "customerEmail",
               customer_mobile AS "customerMobileNumber",
               amount,
               payment_mode AS "paymentMode",
               device_id AS "deviceId",
               status,
+              final_status_response AS "finalStatusResponse",
               created_at AS "timestamp"
             FROM pos_transactions
             ORDER BY id DESC;
@@ -680,8 +683,16 @@ export class PosPaymentController {
       const formattedTransactions = transactions.map((item: any) => {
         const rawTime = item.timestamp || item.createdAt || item.created_at;
         const numAmount = parseFloat(item.amount);
+        const resp = item.finalStatusResponse || item.final_status_response || {};
+        const rzpEntity = resp.payload?.payment?.entity || resp.payment?.entity;
+        
+        const paymentId = rzpEntity?.id || item.transactionId || item.p2pRequestId || 'N/A';
+        const bankRrn = rzpEntity?.acquirer_data?.rrn || resp.rrn || resp.bankRrn || 'N/A';
+
         return {
           ...item,
+          paymentId,
+          bankRrn,
           amount: isNaN(numAmount) ? 0 : numAmount,
           timestamp: getISTISOString(rawTime),
           formattedTimeIST: getISTTimestamp(rawTime)
